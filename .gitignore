@@ -1,0 +1,7 @@
+.venv/
+.pytest_cache/
+__pycache__/
+*.py[cod]
+*.pt
+tests/dati/*
+!tests/dati/riferimento_ponte.json
