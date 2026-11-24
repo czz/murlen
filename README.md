@@ -13,7 +13,9 @@ ogni slot sceglie chi ascoltare). `z`, lo stato portato fra i
 blocchi, è la memoria di lavoro: volatile, riscritta di
 continuo, con un gate che può proteggere slot dalla
 riscrittura. Il deposito dei fatti a lungo termine è `store.py`,
-in questa libreria.
+e `gateway.py` è la porta che lo collega al foglietto: gli
+episodi che lasciano tracce entrano nell'archivio nel sonno e
+tornano come replay nel consolidamento.
 
 MURLEN non lavora su testo, audio o video grezzi. Riceve **sequenze di numeri interi**, dove ogni numero è un simbolo (un glifo, un suono, ...), e impara a indovinare il simbolo successivo. Non riceve etichette: il segnale di apprendimento è l'errore di predizione (la "sorpresa").
 
@@ -25,15 +27,16 @@ sequenze di simboli (id interi)  ->  MURLEN (predizione + memoria)
 
 Licenza: [BUSL 1.1](LICENSE) — libera per uso non commerciale (ricerca, studio, no-profit); le aziende che vogliono farne uso commerciale devono acquistare una licenza. Quattro anni dopo la pubblicazione ogni versione diventa automaticamente **GPL-3.0-or-later**: resta open source per sempre.
 
-![Architettura: simboli -> encoder -> universi (z ricorrente, comm fra voci) -> testa; la sorpresa scrive il foglietto e fa nascere universi; lo Store tiene i fatti](architettura.jpg)
+![Architettura: simboli -> encoder -> universi (z ricorrente, comm fra voci) -> testa; la sorpresa scrive il foglietto e fa nascere universi; il gateway porta gli episodi allo Store e nel sonno li ripresenta come replay](architettura.jpg)
 
 ## Struttura
 
 | File | Ruolo |
 |------|-------|
-| `model.py` | Il "cervello": `MultiUniverse`, rete neurale con K universi |
+| `model.py` | Il nucleo: `MultiUniverse`, rete neurale con K universi |
 | `ponte.py` | Converte i simboli in token e allena la predizione del simbolo successivo |
 | `store.py` | Memoria persistente delle regole (file JSONL append-only) |
+| `gateway.py` | La porta fra il foglietto e l'archivio: episodi fuori, replay dentro |
 
 ### `model.py`: MultiUniverse
 
@@ -47,7 +50,7 @@ Licenza: [BUSL 1.1](LICENSE) — libera per uso non commerciale (ricerca, studio
 - **Comunicazione** (`comm=True`): ogni universo espone un riassunto del proprio stato (la sua "voce"); sul canale passa solo la deviazione dal coro — ciò che una voce dice di diverso dalle altre. Ogni slot di ogni universo legge le voci per contenuto (`Comm`, cross-attention): chi ascolta chi dipende dal contesto, non da un voto globale. Attiva di default con `K>1`; va decisa alla creazione del modello.
 - **Modalità ricorrente** (`tempo=N`): la sequenza viene elaborata a blocchi di N simboli; lo stato degli universi passa da un blocco al successivo — sia via `zinj` (broadcast) sia via `zread` (lettura a contenuto: ogni posizione interroga gli slot di `z`). Ogni slot ha un gate proprio che può rallentarne la riscrittura fino a proteggerlo. Di default `tempo=64` con `K>1` (`TEMPO_UNIVERSI`) e `tempo=0` con `K=1`.
 - **Foglietto** (`foglio`, attivo quando `tempo>0`): memoria episodica indirizzata a contenuto. Dopo ogni finestra `annota(h, sorpresa, pad)` consolida le posizioni il cui simbolo era imprevisto (fence dei quartili sulla distribuzione delle sorprese, più il confine d'episodio): lasciano una traccia snapshot che le posizioni successive interrogano per contenuto, anche oltre il contesto. Il canale sta su `foglio.lam` come `comm`. Si passa fra finestre con `mem0` — distinto da `z0`: si possono ablazionare separatamente. In `impara_predizione` la scrittura avviene dentro il `forward`, a ogni blocco di `tempo`: l'organo si allena anche dentro una finestra sola. Capienza `MEM_CAP=256` tracce. Variante `mem_gate=True`: la scelta di cosa scrivere è appresa da un gate sigmoide invece del fence dei quartili — misurata apprendibile sulla sonda a due fatti (`tests/universi_gate.py`, 1a giunzione sotto il caso su due seed). Misurato: trasporta un fatto discreto oltre ~500 simboli (dove `z` non ci riesce); il binding di due fatti insieme è appreso solo parzialmente.
-- **Neurogenesi** (`cresci()`): aggiunge un universo con "voce" inizialmente muta (pesi a zero). Passando da 1 a 2 universi accende da sola comunicazione (anch'essa muta all'inizio) e `tempo=64`, se non sono stati scelti alla creazione. Funziona con entrambi gli `init` (`'learned'` e `'projected'`). Può scattare da sola durante il training: vedi `vigilanza` in `impara_predizione`.
+- **Crescita** (`cresci()`): aggiunge un universo con "voce" inizialmente muta (pesi a zero). Passando da 1 a 2 universi accende da sola comunicazione (anch'essa muta all'inizio) e `tempo=64`, se non sono stati scelti alla creazione. Funziona con entrambi gli `init` (`'learned'` e `'projected'`). Può scattare da sola durante il training: vedi `vigilanza` in `impara_predizione`.
 - **Compatibilità**: i checkpoint vecchi, con un unico blocco di aggiornamento condiviso, vengono caricati copiando quel blocco in ogni universo.
 
 `forward(ids, pad, causal=False, z0=None, mem0=None, scrivi=None)` restituisce `(z, h)`:
@@ -101,6 +104,16 @@ La soglia si sceglie per ogni memoria e si può cambiare in qualsiasi momento: `
 Metodi principali: `add`, `conferma`, `contraddice`, `revidi`, `simili`, `attive`, `consolidate`, `dimentica`, `audit`, `close`. Nota su `attive`: senza famiglia restituisce solo i record `tipo='regola'`; con famiglia restituisce tutti i tipi — serve a `dimentica`, che deve far decadere anche gli episodi. `simili` richiama per campi uguali fra i parametri, solo sullo stato corrente di ogni regola (le versioni storiche non contano), con un piccolo rinforzo per le regole già confermate; l'indice invertito sui campi evita di scansionare lo store intero.
 Lo store tiene un handle di append persistente (`close()` lo rilascia, altrimenti alla fine del processo). Le query stanno sugli indici in RAM (`_by_id` stato corrente, `_inv` campi, `_by_n` conferme per famiglia); il file si rilegge solo all'avvio.
 Se il processo viene interrotto a metà scrittura, la riga incompleta viene eliminata al caricamento.
+
+### `gateway.py`: la porta episodi <-> archivio
+
+Message broker bidirezionale fra le tracce del foglietto e lo Store. Le tracce sono vettori `h` senza simboli: l'episodio archiviabile è la finestra che le ha prodotte, catturata al confine.
+
+- `Gateway(store)` — il broker si costruisce su uno Store esistente.
+- `veglia(ids, sorpresa, pad, foglio)` — annota come episodi del giorno le finestre vissute che hanno lasciato tracce oltre al confine d'episodio (sempre tracciato). La scelta "cosa merita memoria" resta del foglietto (il suo fence dei quartili): qui si chiede solo *questa finestra ha scritto?*. Gli episodi sono simboli grezzi, nessuna interpretazione.
+- `sonno(recenti=None)` — consegna gli episodi all'archivio (record `tipo='episodio'`; ri-osservare gli stessi simboli nel mondo è una conferma vera, decisa per identità), fa decadere i mai-rinforzati (`dimentica`), e restituisce il materiale di **replay**: gli episodi attivi in ordine di nascita, pronti da rimescolare nelle `seqs` di `impara_predizione`. Il replay è la via che densifica le letture per indirizzo — il carico che il canale episodico richiede (vedi `sonda_scala_n32`).
+
+Il buffer del giorno è in RAM: un processo che muore prima del sonno perde gli episodi non consegnati. Copre il percorso a fence; la variante `mem_gate` non è ancora agganciata. Il ritmo veglia/sonno (quando dormire) non è compito di questo modulo: vive nell'organismo (`mimo/cervello/`).
 
 ## Requisiti
 
@@ -171,7 +184,7 @@ Gli script `tests/universi_*.py` e `confronto_init.py` non sono test di regressi
 
 - Non legge file audio, immagini o video: servono simboli già estratti.
 - Non genera testo, audio o video: prevede solo il simbolo successivo.
-- Non segmenta le sequenze in parole e non scopre regole in automatico: `store.py` fornisce la memoria, ma nessun modulo di MURLEN la riempie.
+- Non segmenta le sequenze in parole e non scopre regole in automatico: `store.py` fornisce la memoria e `gateway.py` la riempie di **episodi** (le finestre che hanno lasciato tracce); le *regole* restano da scrivere dall'esterno.
 
 ## Problemi noti
 
@@ -182,7 +195,6 @@ Gli script `tests/universi_*.py` e `confronto_init.py` non sono test di regressi
 - **`z` non trasporta fatti discreti**: lo stato porta continuità locale oltre il contesto, ma informazione discreta a lungo raggio no — misurato su compiti a chiave, marche e dialogo. `z` è memoria di lavoro, non archivio: il trasporto dei fatti è del **foglietto**, misurato su uno e due fatti legati insieme (dialogo: 1a giunzione di finestra 2 sotto il caso solo col foglietto — 1.27 vs 1.39 a fatto singolo, 2.61 vs 2.77 con binding a due; dimenticarlo o spegnerne `lam` la riporta sopra il caso). Serve allenamento a curriculum e passi sufficienti (`tests/universi_dialogo.py` — fatto singolo, `tests/universi_dialogo_prosegui.py` — binding a due). Con la scrittura a gate appreso (`mem_gate`) il positivo si replica su due seed: 1a giunzione 2.09–2.60 contro caso 2.773, e spegnere il foglietto la riporta a ~3.0-3.2 (`tests/universi_gate.py`).
 - **Ruoli degli universi**: nessuna specializzazione pulita (né per lingua né per partito), ma sul dialogo compaiono effetti selettivi per tipo di risposta — per esempio zittire un universo dimezza la loss di una giunzione specifica e la peggiora su un'altra. Differenziazione funzionale embrionale, non ruoli (`tests/universi_ruoli.py`).
 - **Reasoning a catena**: misurato positivo — ogni giunzione produce lo stato per la successiva; il foglietto trasporta lo stato *calcolato* oltre il confine (1a giunzione di finestra 2: 2.24 vs caso 2.77; dimenticato: 3.2-3.8) e la catena prosegue in finestra 2 (giunzioni 0.17). È il livello più basso di inferenza multi-passo, ma è verificato (`tests/universi_catena.py`, `universi_prosegui.py`).
-- **`Store.revidi`**: conserva `n_confirm` della versione precedente — una regola revisionata si ri-consolida alla prima conferma successiva, senza ri-guadagnarsi le prove. Semantica da rivedere con l'uso reale.
 - **Su testo vero gli organi non servono (ancora)**: su finestre consecutive di libri in 3 lingue (1000 passi, caratteri), portare z+foglietto non aiuta e anzi costa un filo (+0.005-0.02). Verdetto ora solido: con il foglietto allenato dentro il forward `lam` **scende** da solo (~0.075→0.056) — dove le tracce sono ridondanti rispetto all'encoder il modello stesso chiude l'organo. Coerente col quadro: i meccanismi si accendono su compiti con fatti che ritornano; sul testo naturale a questa scala il segnale memoria è debole (`tests/universi_libro_finestre.py`, `universi_libro.py`).
 
 ## Costanti di default
@@ -223,7 +235,7 @@ Sweep `tests/scala.py`: 12 assi × 3 valori × 2 seed, compito 200 fatti a dista
 Sonde dedicate (`tests/sonda_*.py`, risultati in `tests/dati/`):
 
 - **`sonda_campo` / `sonda_campo_libro`** — il bordo di finestra esiste (posizioni iniziali più sorprendenti), ma su testo vero `z`+foglietto lo compensano del tutto (gap residuo ~0). `ctx` resta una taglia di nascita: nessuna crescita in vita giustificata dalla misura.
-- **`sonda_sviluppo`** — E1: una mente nata K=1 impara più in fretta di una nata K=3 (1.53 vs 1.75); la vigilanza non è mai scattata perché la loss era già bassa. E2: il gap d=96/d=384 a 340 passi (1.07) si chiude a 840 — nessuna saturazione strutturale misurata.
+- **`sonda_sviluppo`** — E1: un modello nato K=1 impara più in fretta di uno nato K=3 (1.53 vs 1.75); la vigilanza non è mai scattata perché la loss era già bassa. E2: il gap d=96/d=384 a 340 passi (1.07) si chiude a 840 — nessuna saturazione strutturale misurata.
 - **`sonda_vigilanza`** — la vigilanza a soglia assoluta è cieca alla saturazione: la loss scende sotto la mediana di warmup e ci resta, mai scattata. Il segnale giusto sarebbe lo stallo (pendenza): separabile — plateau Q3=0.09 vs apprendimento Q1=0.15 — ma va testato su un carico dove la saturazione esiste davvero.
 - **`sonda_memcap` / `sonda_lettore` / `sonda_lettore_min` / `sonda_lettore_libro`** — il lettore del foglietto a 500 passi: **non si forma** su compiti-esame (piatto a 1–60 fatti, fence o gate appreso, diretto o curriculum) né su testo vero alle posizioni di riuso (2.935 ≈ 2.934 ≈ 2.935). Verdetto poi ribaltato dalla sonda di scala: era tempo, non struttura (vedi `sonda_scala_indirizzo`).
 - **`sonda_lettore_fattori`** — quando nasce il lettore *posizionale*: la variabile decisiva è **quante volte lo stesso fatto viene letto per episodio**. Uso fitto → lettura di contenuto sempre; uso singolo → mai (intatto ≈ episodio-1). Curriculum irrilevante, binding arbitrario costa ma non uccide.
