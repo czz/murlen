@@ -241,14 +241,38 @@ class Foglietto(nn.Module):
     gate attraverso le finestre successive via mem0 —
     il modello impara a scegliere cosa servira'."""
 
-    def __init__(self, d=D, nhead=NHEAD, scrittura=False):
+    def __init__(self, d=D, nhead=NHEAD, scrittura=False,
+                 coppia=False, ancora=False):
         super().__init__()
+        self.ancora = ancora and coppia
         with torch.random.fork_rng():
             self.read = nn.MultiheadAttention(
                 d, nhead, batch_first=True)
             self.scrittura = nn.Linear(d, 1) \
                 if scrittura else None
-        self.lam = nn.Parameter(torch.tensor(0.1))
+            # chiavi a coppia di simboli: la traccia e'
+            # indirizzata dal binding [s_{p-1}, s_p],
+            # non da h — il query lato lettura proietta
+            # h nello spazio delle chiavi (2d)
+            if self.ancora:
+                # meta' sinistra della query e' l'embedding
+                # del simbolo corrente (filtro di famiglia
+                # senza apprendimento); solo la meta'
+                # destra si impara — nasce a zero: il
+                # filtro domina finche' serve
+                self.qpair = nn.Linear(d, d)
+                nn.init.zeros_(self.qpair.weight)
+                nn.init.zeros_(self.qpair.bias)
+            else:
+                self.qpair = nn.Linear(d, 2 * d) \
+                    if coppia else None
+        # con le chiavi a coppia il canale nasce rumoroso:
+        # init muto si e' chiuso da solo (letture casuali
+        # peggiorano la loss -> il gate si abbassa) —
+        # partire alto da' a qpair il gradiente per
+        # imparare l'indirizzamento
+        self.lam = nn.Parameter(torch.tensor(
+            1. if coppia else 0.1))
 
     def scegli_valori(self, v, pad_j):
         """(B,N) bool: posizioni sopra il fence dei quartili
@@ -279,7 +303,8 @@ class MultiUniverse(nn.Module):
     def __init__(self, vocab, K=1, T=T_DEFAULT, init='learned',
                  comm=None, enc_layers=ENC_LAYERS, d=D, m=M,
                  tempo=None, nhead=NHEAD, ctx=CTX, jitter=JITTER,
-                 mem=None, mem_gate=False):
+                 mem=None, mem_gate=False, coppia=False,
+                 ancora=False, simbolo=False):
         super().__init__()
         if d % nhead:
             raise ValueError('d=%d non e\' divisibile per nhead=%d'
@@ -337,8 +362,13 @@ class MultiUniverse(nn.Module):
         # blocchi (tempo attivo): li' z e' memoria di
         # lavoro e il foglietto e' l'archivio. Non
         # dipende da K: in cresci() non serve toccarlo
-        self.foglio = Foglietto(d, nhead, scrittura=mem_gate) \
+        self.foglio = Foglietto(d, nhead, scrittura=mem_gate,
+                                coppia=coppia, ancora=ancora) \
             if mem else None
+        self._coppia = coppia
+        self._ancora = ancora and coppia
+        self._simbolo = simbolo
+        self._coppie = None
         self._mem = []
 
     @property
@@ -415,7 +445,9 @@ class MultiUniverse(nn.Module):
         if not self.tempo and self._tempo_auto:
             self.tempo = TEMPO_UNIVERSI
         if not self.mem_on and self._mem_auto and self.tempo:
-            self.foglio = Foglietto(d, self.nhead).to(device)
+            self.foglio = Foglietto(
+                d, self.nhead, coppia=self._coppia,
+                ancora=self._ancora).to(device)
             with torch.no_grad():
                 self.foglio.lam.zero_()
             self.mem_on = True
@@ -483,7 +515,7 @@ class MultiUniverse(nn.Module):
         return super().load_state_dict(
             sd, strict)
 
-    def _leggi_foglietto(self, h_j):
+    def _leggi_foglietto(self, h_j, coppie=None):
         """Le posizioni interrogano le tracce per contenuto."""
         B, d = h_j.size(0), h_j.size(2)
         if not self._mem:
@@ -492,6 +524,42 @@ class MultiUniverse(nn.Module):
         S = max(n)
         if not S:
             return h_j
+        if self._coppia:
+            # le chiavi delle tracce sono coppie di
+            # simboli (2d): il lettore proietta h nello
+            # spazio chiave con qpair, i valori restano
+            # le h depositate
+            kk = h_j.new_zeros(B, S, 2 * d)
+            vv = h_j.new_zeros(B, S, d)
+            kpm = torch.ones(B, S, dtype=torch.bool,
+                             device=h_j.device)
+            for b in range(B):
+                if n[b]:
+                    kk[b, :n[b]] = \
+                        self._mem[b][:, :2 * d]
+                    vv[b, :n[b]] = \
+                        self._mem[b][:, 2 * d:]
+                    kpm[b, :n[b]] = False
+            if self._ancora:
+                # il cue e' il simbolo corrente: la meta'
+                # sinistra della query e' il suo embedding
+                # — seleziona gratis la famiglia di tracce
+                # con lo stesso simbolo a sinistra
+                if coppie is None:
+                    coppie = self._coppie
+                if coppie is None or \
+                        coppie.size(1) != h_j.size(1):
+                    return h_j
+                q = torch.cat(
+                    [coppie[:, :, d:],
+                     self.foglio.qpair(h_j)], -1)
+            else:
+                q = self.foglio.qpair(h_j)
+            att = q @ kk.transpose(1, 2) / (2 * d) ** .5
+            att = att.masked_fill(
+                kpm[:, None, :], float('-inf')
+            ).softmax(-1).nan_to_num(0.)
+            return h_j + self.foglio.lam * (att @ vv)
         kv = h_j.new_zeros(B, S, d)
         kpm = torch.ones(B, S, dtype=torch.bool,
                          device=h_j.device)
@@ -503,7 +571,7 @@ class MultiUniverse(nn.Module):
             h_j, kv, kv, key_padding_mask=kpm,
             need_weights=False)[0]
 
-    def annota(self, h, sorpresa, pad):
+    def annota(self, h, sorpresa, pad, coppie=None):
         """Consolida: le posizioni il cui simbolo ha sorpreso
         il modello lasciano una traccia nel foglietto —
         l'errore di predizione decide cosa merita memoria
@@ -519,12 +587,57 @@ class MultiUniverse(nn.Module):
         servono ai blocchi dopo.
         -> le tracce consolidate, da ripassare come
         `mem0` al forward successivo (None se il
-        foglietto e' spento)."""
+        foglietto e' spento).
+        Con `coppia` attiva la regola cambia: la posizione
+        p lascia traccia se la sua coppia di simboli
+        (s_{p-1}, s_p) non e' gia' coperta nel buffer —
+        ogni binding distinto viene scritto una volta,
+        le ripetizioni no; la riga e' (chiave 2d, h) —
+        con `simbolo` il valore e' emb(s_p) al posto
+        di h: il contenuto richiamato, non lo stato."""
         if not self.mem_on:
             return
+        largh = 3 * h.size(2) if self._coppia \
+            else h.size(2)
         if not self._mem:
-            self._mem = [h.new_zeros(0, h.size(2))
+            self._mem = [h.new_zeros(0, largh)
                          for _ in range(h.size(0))]
+        if self._coppia:
+            if coppie is None:
+                coppie = self._coppie
+            if coppie is None:
+                return self._mem or None
+            dd = h.size(2)
+            for b in range(h.size(0)):
+                pos = torch.nonzero(~pad[b]).flatten()
+                if not pos.numel():
+                    continue
+                ck = coppie[b][pos]
+                keep = torch.ones(
+                    pos.numel(), dtype=torch.bool,
+                    device=h.device)
+                if self._mem[b].size(0):
+                    eq = (ck[:, None, :] ==
+                          self._mem[b][None, :, :2 * dd]
+                          ).all(-1)
+                    keep &= ~eq.any(1)
+                dup = (ck[:, None, :] ==
+                       ck[None, :, :]).all(-1)
+                keep &= ~dup.triu(1).any(0)
+                if keep.any():
+                    # simbolo: il contenuto richiamato
+                    # e' il simbolo stesso (emb(s_p),
+                    # meta' destra della chiave) — un
+                    # uomo ricorda la parola, non lo
+                    # stato che la prediceva
+                    val = ck[keep][:, dd:].detach() \
+                        if self._simbolo else \
+                        h[b][pos][keep].detach()
+                    nuove = torch.cat(
+                        [ck[keep], val], -1)
+                    self._mem[b] = torch.cat(
+                        [self._mem[b], nuove])[-MEM_CAP:]
+            return self._mem or None
         if self.foglio.scrittura is not None:
             # scelta appresa: tracce pesate dal gate,
             # niente detach — il credito torna al gate
@@ -553,20 +666,31 @@ class MultiUniverse(nn.Module):
         h = self.enc(ids, pad, causal=causal)
         B, N = h.shape[:2]
         if self.mem_on:
-            # mem0 valido: B tracce (S,d). Se la
-            # forma non torna si riparte da
-            # vuoto — stessa regola di z0
+            # mem0 valido: B tracce (S, d o 3d con
+            # chiavi a coppia). Se la forma non torna
+            # si riparte da vuoto — stessa regola di z0
+            largh = 3 * h.size(2) if self._coppia \
+                else h.size(2)
             ok = mem0 is not None and len(mem0) == B
             if ok:
                 try:
                     ok = all(m.dim() == 2 and
-                             m.size(1) == h.size(2)
+                             m.size(1) == largh
                              for m in mem0)
                 except AttributeError:
                     ok = False
             self._mem = [m.clone() for m in mem0] if ok \
-                else [h.new_zeros(0, h.size(2))
+                else [h.new_zeros(0, largh)
                       for _ in range(B)]
+            if self._coppia:
+                # chiavi delle tracce: la posizione p
+                # e' indirizzata dal binding dei due
+                # simboli che la producono (s_{p-1}, s_p)
+                emb = self.enc.tok(ids)
+                prev = torch.cat(
+                    [emb.new_zeros(B, 1, emb.size(2)),
+                     emb[:, :-1]], 1)
+                self._coppie = torch.cat([prev, emb], -1)
         z = z0
         if z is not None:
             if z.size(0) != B or z.size(1) > self.K:
@@ -596,7 +720,10 @@ class MultiUniverse(nn.Module):
             else:
                 z = self.init(h_j, p_j)
             if self.mem_on:
-                h_j = self._leggi_foglietto(h_j)
+                h_j = self._leggi_foglietto(
+                    h_j,
+                    self._coppie[:, a:a + self.tempo]
+                    if self._ancora else None)
             for _ in range(self.T):
                 z_new, g_c = self.upd(z, h_j, p_j)
                 z = z + (self.gate + g_c).sigmoid() * (
@@ -618,12 +745,15 @@ class MultiUniverse(nn.Module):
             # fra finestre (mem0)
             if self.mem_on and (
                     scrivi is not None or
+                    self._coppia or
                     self.foglio.scrittura
                     is not None):
                 self.annota(
                     h_j,
                     scrivi(a, h_j, p_j)
-                    if scrivi else None, p_j)
+                    if scrivi else None, p_j,
+                    self._coppie[:, a:a + self.tempo]
+                    if self._coppia else None)
         return z, torch.cat(hs, 1)
 
 
