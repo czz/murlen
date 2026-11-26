@@ -304,7 +304,7 @@ class MultiUniverse(nn.Module):
                  comm=None, enc_layers=ENC_LAYERS, d=D, m=M,
                  tempo=None, nhead=NHEAD, ctx=CTX, jitter=JITTER,
                  mem=None, mem_gate=False, coppia=False,
-                 ancora=False, simbolo=False):
+                 ancora=False, simbolo=False, mem_cap=None):
         super().__init__()
         if d % nhead:
             raise ValueError('d=%d non e\' divisibile per nhead=%d'
@@ -368,6 +368,7 @@ class MultiUniverse(nn.Module):
         self._coppia = coppia
         self._ancora = ancora and coppia
         self._simbolo = simbolo
+        self._mem_cap = mem_cap or MEM_CAP
         self._coppie = None
         self._mem = []
 
@@ -636,7 +637,7 @@ class MultiUniverse(nn.Module):
                     nuove = torch.cat(
                         [ck[keep], val], -1)
                     self._mem[b] = torch.cat(
-                        [self._mem[b], nuove])[-MEM_CAP:]
+                        [self._mem[b], nuove])[-self._mem_cap:]
             return self._mem or None
         if self.foglio.scrittura is not None:
             # scelta appresa: tracce pesate dal gate,
@@ -649,7 +650,7 @@ class MultiUniverse(nn.Module):
                 nuove = h[b][ok] * g[b][ok].unsqueeze(-1)
                 if nuove.size(0):
                     self._mem[b] = torch.cat(
-                        [self._mem[b], nuove])[-MEM_CAP:]
+                        [self._mem[b], nuove])[-self._mem_cap:]
         else:
             s = sorpresa.clone()
             s[:, 0] = float('inf')
@@ -658,7 +659,7 @@ class MultiUniverse(nn.Module):
                 nuove = h[b][sel[b]].detach()
                 if nuove.size(0):
                     self._mem[b] = torch.cat(
-                        [self._mem[b], nuove])[-MEM_CAP:]
+                        [self._mem[b], nuove])[-self._mem_cap:]
         return self._mem or None
 
     def forward(self, ids, pad, causal=False, z0=None,

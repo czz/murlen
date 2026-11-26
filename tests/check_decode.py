@@ -53,7 +53,7 @@ def oracolo(core, testa, test, vocab, dev, bersaglio,
     giun = torch.tensor([vocab[GIUN + i]
                          for i in range(NVAL)], device=dev)
     qry = torch.tensor([vocab[QRY + i]
-                        for i in range(NFATTI_MAX)],
+                        for i in range(NFATTI)],
                        device=dev)
     emb = core.enc.tok.weight
     z, mem, stati = None, None, []
@@ -203,26 +203,44 @@ if __name__ == '__main__':
     passi = int(sys.argv[2]) if len(sys.argv) > 2 else 2000
     seed = next((int(a[4:]) for a in sys.argv
                  if a.startswith('seed')), 0)
-    test = dati(64, 2 + seed * 1000, NFATTI)
-    t0 = dati(8, 9 + seed * 1000, NFATTI)
+    NFATTI = next((int(a[1:]) for a in sys.argv
+                   if a[:1] == 'n' and a[1:].isdigit()),
+                  NFATTI)
+    cap = next((int(a[3:]) for a in sys.argv
+                if a.startswith('cap')), None)
+    blocchi = None
+    if NFATTI > NFATTI_MAX:
+        # i range di default coprono 32 fatti: oltre
+        # le query colliderebbero con ANS e GIUN —
+        # si allocano blocchi disgiunti
+        MARK = 1000
+        QRY = MARK + NFATTI + 10
+        ANS = QRY + NFATTI + 10
+        GIUN = ANS + NVAL + 10
+        blocchi = (MARK, QRY, ANS, GIUN)
+    test = dati(64, 2 + seed * 1000, NFATTI, blocchi)
+    t0 = dati(8, 9 + seed * 1000, NFATTI, blocchi)
     tutti = [list(range(0, GIUN + NVAL + 2))]
     vocab, n = vocab_da_sequenze(t0 + test + tutti)
     torch.manual_seed(seed)
     core = MM.MultiUniverse(
-        n, K=K, coppia=True, simbolo='sim' in sys.argv)
-    train = dati(passi * 8, 1 + seed * 1000, NFATTI)
+        n, K=K, coppia=True, simbolo='sim' in sys.argv,
+        mem_cap=cap)
+    train = dati(passi * 8, 1 + seed * 1000, NFATTI,
+                 blocchi)
     hist, testa = allena(
         core, finestre(train, vocab, dev), vocab, dev,
         passi=passi, batch=8, seed=seed)
-    print('train: %.3f -> %.3f   lam=%.3f' % (
+    print('train: %.3f -> %.3f   lam=%.3f   cap=%d' % (
         hist[0], sum(hist[-10:]) / 10,
-        core.foglio.lam.item()), flush=True)
-    lettore(core, testa, test, vocab, dev)
-    for nome, base in (('mark', MARK), ('query', QRY),
-                       ('emb', None)):
-        bersaglio = None if base is None else \
+        core.foglio.lam.item(), core._mem_cap), flush=True)
+    lettore(core, testa, test, vocab, dev, blocchi,
+            nq=NFATTI)
+    for nome, b_ in (('mark', MARK), ('query', QRY),
+                     ('emb', None)):
+        bersaglio = None if b_ is None else \
             torch.tensor(
-                [vocab[base + i] for i in range(NFATTI_MAX)],
+                [vocab[b_ + i] for i in range(NFATTI)],
                 device=dev)
         oracolo(core, testa, test, vocab, dev,
                 bersaglio, nome)

@@ -35,23 +35,25 @@ MARK, QRY, ANS, GIUN = 300, 340, 400, 450
 L = 4 * WIN
 
 
-def dati(n, seed, nfatti):
+def dati(n, seed, nfatti, simboli=None):
     """Testa [MARK+i, ANS+v_i] poi il resto della
     sequenza e' solo coppie [QRY+q, GIUN+v_q]
     mischiate — ogni fatto interrogato ~(L-2N)/(2N)
-    volte."""
+    volte. simboli = (mark, qry, ans, giun) per
+    nfatti oltre i range di default."""
+    mk, qy, an, gj = simboli or (MARK, QRY, ANS, GIUN)
     r = random.Random(seed)
     out = []
     for _ in range(n):
         vals = [r.randrange(NVAL) for _ in range(nfatti)]
         s = []
         for i in range(nfatti):
-            s += [MARK + i, ANS + vals[i]]
+            s += [mk + i, an + vals[i]]
         npair = (L - len(s)) // 2
         for i in range(npair):
             q = i % nfatti          # ordine ciclico:
                                     # copertura uniforme
-            s += [QRY + q, GIUN + vals[q]]
+            s += [qy + q, gj + vals[q]]
         out.append(s[:L])
     return out
 
@@ -66,7 +68,8 @@ def finestre(seqs, vocab, dev):
 
 
 @torch.no_grad()
-def lettore(core, testa, test, vocab, dev):
+def lettore(core, testa, test, vocab, dev,
+            simboli=None, nq=NFATTI_MAX):
     """CE sulle risposte GIUN+.. per ablazioni:
     intatto / svuotato / episodio-1 / senza-z.
     La maschera 'prima' tiene solo la prima occorrenza
@@ -75,10 +78,12 @@ def lettore(core, testa, test, vocab, dev):
     la risposta puo' venire solo da z o foglietto —
     il resto lo risolve l'induzione sul contesto."""
     core.eval()
-    giun = torch.tensor([vocab[GIUN + i]
+    gj = simboli[3] if simboli else GIUN
+    qy = simboli[1] if simboli else QRY
+    giun = torch.tensor([vocab[gj + i]
                          for i in range(NVAL)], device=dev)
-    qry = torch.tensor([vocab[QRY + i]
-                        for i in range(NFATTI_MAX)],
+    qry = torch.tensor([vocab[qy + i]
+                        for i in range(nq)],
                        device=dev)
     W = finestre(test, vocab, dev)
     z, mem, stati = None, None, []

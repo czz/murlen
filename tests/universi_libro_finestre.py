@@ -169,7 +169,8 @@ def valuta(core, testa, W, dev, tag=''):
 
 if __name__ == '__main__':
     dev = sys.argv[1] if len(sys.argv) > 1 else 'cuda'
-    passi = int(sys.argv[2]) if len(sys.argv) > 2 else PASSI
+    passi = next((int(a) for a in sys.argv[2:]
+                  if a.isdigit()), PASSI)
     r = random.Random(1)
     testi = libri()
     train_t, test_t = {}, {}
@@ -186,7 +187,10 @@ if __name__ == '__main__':
                                  [s for _, s in test])
     print('vocabolario: %d simboli' % n)
     torch.manual_seed(0)
-    core = MultiUniverse(n, K=K)
+    core = MultiUniverse(
+        n, K=K,
+        coppia='sim' in sys.argv or 'coppia' in sys.argv,
+        simbolo='sim' in sys.argv)
     testa = None
     ck_nome = os.path.join(os.path.dirname(
         os.path.abspath(__file__)),
