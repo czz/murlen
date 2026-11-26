@@ -170,8 +170,10 @@ def allena(core, W, vocab, dev, passi=PASSI, batch=BATCH,
         if picco is not None:
             ad.registra(nb, win, picco)
         if (i + 1) % 25 == 0:
-            print('passo %d/%d loss %.3f (batch %d)'
-                  % (i + 1, passi, sum(hist[-25:]) / 25, nb),
+            print('passo %d/%d loss %.3f (batch %d) lam=%.3f'
+                  % (i + 1, passi, sum(hist[-25:]) / 25, nb,
+                     core.foglio.lam.item()
+                     if core.foglio is not None else -1),
                   flush=True)
     return hist, testa
 

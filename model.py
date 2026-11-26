@@ -618,12 +618,20 @@ class MultiUniverse(nn.Module):
                     pos.numel(), dtype=torch.bool,
                     device=h.device)
                 if self._mem[b].size(0):
-                    eq = (ck[:, None, :] ==
-                          self._mem[b][None, :, :2 * dd]
-                          ).all(-1)
-                    keep &= ~eq.any(1)
-                dup = (ck[:, None, :] ==
-                       ck[None, :, :]).all(-1)
+                    # pos x righe a blocchi: il confronto
+                    # pieno non sta in VRAM a cap grandi
+                    for i in range(0, pos.numel(), 128):
+                        c = ck[i:i + 128]
+                        eq = (c[:, None, :] ==
+                              self._mem[b][None, :, :2 * dd]
+                              ).all(-1)
+                        keep[i:i + 128] &= ~eq.any(1)
+                dup = ck.new_zeros(pos.numel(), pos.numel(),
+                                   dtype=torch.bool)
+                for i in range(0, pos.numel(), 128):
+                    dup[i:i + 128] = (
+                        ck[i:i + 128, None, :] ==
+                        ck[None, :, :]).all(-1)
                 keep &= ~dup.triu(1).any(0)
                 if keep.any():
                     # simbolo: il contenuto richiamato

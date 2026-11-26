@@ -1,18 +1,19 @@
 """Il lettore trasferisce?
 
-sonda_scala_indirizzo: a 2000 passi il canale indirizzato
-nasce sul compito N=8 (prima 0.41 vs 3.82/6.81). Domanda
-decisiva per MIMO: la competenza e' AGNOSTICA al fatto —
-un motore generale — o legata agli 8 fatti del training?
+check_decode: con coppia+simbolo il canale indirizzato
+nasce a N=32 (prima 0.030) e regge a N=128 solo con
+cap+passi in piu'. Domanda decisiva per MIMO: la
+competenza e' AGNOSTICA al fatto — un motore generale —
+o si riallena a ogni scala?
 
-Un solo training (N=8 denso, 2000 passi), poi due eval
-sullo stesso modello:
+Un solo training (N=32, coppia+simbolo), poi eval a
+ladder N=32/64/128 sullo stesso modello: le marche di
+eval sono simboli mai visti in training (blocchi
+disgiunti) — se il canale e' agnostico basta la
+consistenza delle chiavi, non l'embedding appresa.
 
-1. N=8  — controllo: deve replicare il positivo
-2. N=32 — stesso formato, 24 fatti mai visti: il canale
-   generalizza senza riallenare?
-
-python murlen/tests/sonda_trasferimento.py [cuda|cpu]
+python murlen/tests/sonda_trasferimento.py \
+    [cuda|cpu] [passi] [seed<N>] [sim] [cap<N>]
 """
 import glob
 import os
@@ -35,15 +36,16 @@ import sonda_pressione_indirizzo as SP  # noqa: E402
 
 @torch.no_grad()
 def lettore_generico(core, testa, test, vocab, dev,
-                     maschere_extra=None):
+                     blocchi, nfatti, maschere_extra=None):
     """Ablazioni sulle posizioni GIUN e sulla maschera
     'prima'; se maschere_extra e' dato (lista (riu,det)
     per sequenza) misura anche il riuso lontano."""
     core.eval()
-    giun = torch.tensor([vocab[GIUN + i]
+    gj, qy = blocchi[3], blocchi[1]
+    giun = torch.tensor([vocab[gj + i]
                          for i in range(NVAL)], device=dev)
-    qry = torch.tensor([vocab[SP.QRY + i]
-                        for i in range(SP.NFATTI_MAX)],
+    qry = torch.tensor([vocab[qy + i]
+                        for i in range(nfatti)],
                        device=dev)
     W = finestre(test, vocab, dev)
     z, mem, stati = None, None, []
@@ -127,24 +129,51 @@ def lettore_generico(core, testa, test, vocab, dev,
 
 if __name__ == '__main__':
     dev = sys.argv[1] if len(sys.argv) > 1 else 'cuda'
-    passi = 2000
-    # training: stesso compito N=8 denso del positivo
-    t0 = dati(8, 9, 8)
-    test8 = dati(64, 2, 8)
-    test32 = dati(64, 3, 32)
-    tutti = [list(range(0, GIUN + NVAL + 2))]
-    vocab, n = vocab_da_sequenze(t0 + test8 + test32 + tutti)
-    torch.manual_seed(0)
-    core = MM.MultiUniverse(n, K=K)
-    train = dati(passi * 8, 1, 8)
+    passi = next((int(a) for a in sys.argv[2:]
+                  if a.isdigit()), 2000)
+    seed = next((int(a[4:]) for a in sys.argv
+                 if a.startswith('seed')), 0)
+    sim = 'sim' in sys.argv
+    cap = next((int(a[3:]) for a in sys.argv
+                if a.startswith('cap')), None)
+    NTR = 32
+    NEV = [32, 64, 128]
+    # ANS/GIUN fissi fra i blocchi: il vocabolario delle
+    # risposte e' condiviso. Per N>32 marche e query
+    # vanno su id 0-299: mai emesse dai dati di training,
+    # righe emb non allenate ma consistenti — l'eval
+    # misura l'agnosticismo del canale, non simboli noti.
+    # Bonus: n resta ~472 — stesso stream di init del
+    # run da prima=0.030, il controllo replica per
+    # costruzione.
+    blocchi = {}
+    for n_ in NEV:
+        blocchi[n_] = (SP.MARK, SP.QRY, SP.ANS, SP.GIUN) \
+            if n_ <= SP.NFATTI_MAX else \
+            (0, n_, SP.ANS, SP.GIUN)
+    t0 = dati(8, 9, NTR, blocchi[NTR])
+    tests = {n_: dati(64, 2 + n_, n_, blocchi[n_])
+             for n_ in NEV}
+    tutti = [list(range(0, SP.GIUN + NVAL + 2))]
+    vocab, n = vocab_da_sequenze(
+        t0 + sum(tests.values(), []) + tutti)
+    torch.manual_seed(seed)
+    core = MM.MultiUniverse(n, K=K, coppia=True,
+                            simbolo=sim)
+    train = dati(passi * 8, 1, NTR, blocchi[NTR])
     hist, testa = allena(
         core, finestre(train, vocab, dev), vocab, dev,
-        passi=passi, batch=8)
-    print('train: %.3f -> %.3f' % (
-        hist[0], sum(hist[-10:]) / 10), flush=True)
+        passi=passi, batch=8, seed=seed)
+    print('train: %.3f -> %.3f   lam=%.3f   cap=%d' % (
+        hist[0], sum(hist[-10:]) / 10,
+        core.foglio.lam.item(), core._mem_cap), flush=True)
 
-    print('=== eval N=8 (controllo) ===', flush=True)
-    lettore_generico(core, testa, test8, vocab, dev)
-
-    print('=== eval N=32 (fatti mai visti) ===', flush=True)
-    lettore_generico(core, testa, test32, vocab, dev)
+    for n_ in NEV:
+        # la capienza e' una risorsa di retention, non
+        # un peso appreso: si dimensiona per N in eval
+        # (8x i fatti copre coppie+transizioni)
+        core._mem_cap = cap or max(256, 8 * n_)
+        print('=== eval N=%d (cap=%d) ===' % (
+            n_, core._mem_cap), flush=True)
+        lettore_generico(core, testa, tests[n_], vocab, dev,
+                         blocchi[n_], n_)
