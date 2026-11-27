@@ -107,7 +107,11 @@ def passo(core, testa, opt, W, sel, dev):
 
 
 def allena(core, W, vocab, dev, passi=PASSI, batch=BATCH,
-           seed=0, testa=None):
+           seed=0, testa=None, lam_aperto=0):
+    """lam_aperto>0: nei primi N passi il gate del foglietto
+    non puo' chiudere sotto 1 — il canale ha un periodo di
+    prova prima di essere giudicato (a N alto il retrieval
+    immaturo spingeva lam sotto 1: stato assorbente)."""
     core.to(dev)
     if testa is None:
         testa = TestaPredizione(
@@ -165,6 +169,9 @@ def allena(core, W, vocab, dev, passi=PASSI, batch=BATCH,
                     ad.rifiuto()
                 nb = min(ad.scegli(dopo), nb // 2)
             libera = dopo
+        if i < lam_aperto and core.foglio is not None:
+            with torch.no_grad():
+                core.foglio.lam.clamp_(min=1.)
         sched.step()
         picco = _picco(dev, base)
         if picco is not None:

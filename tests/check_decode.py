@@ -208,6 +208,8 @@ if __name__ == '__main__':
                   NFATTI)
     cap = next((int(a[3:]) for a in sys.argv
                 if a.startswith('cap')), None)
+    aperto = next((int(a[6:]) for a in sys.argv
+                   if a.startswith('aperto')), 0)
     blocchi = None
     if NFATTI > NFATTI_MAX:
         # i range di default coprono 32 fatti: oltre
@@ -230,10 +232,12 @@ if __name__ == '__main__':
                  blocchi)
     hist, testa = allena(
         core, finestre(train, vocab, dev), vocab, dev,
-        passi=passi, batch=8, seed=seed)
-    print('train: %.3f -> %.3f   lam=%.3f   cap=%d' % (
-        hist[0], sum(hist[-10:]) / 10,
-        core.foglio.lam.item(), core._mem_cap), flush=True)
+        passi=passi, batch=8, seed=seed, lam_aperto=aperto)
+    print('train: %.3f -> %.3f   lam=%.3f   cap=%d'
+          '   aperto=%d' % (
+              hist[0], sum(hist[-10:]) / 10,
+              core.foglio.lam.item(), core._mem_cap,
+              aperto), flush=True)
     lettore(core, testa, test, vocab, dev, blocchi,
             nq=NFATTI)
     for nome, b_ in (('mark', MARK), ('query', QRY),
