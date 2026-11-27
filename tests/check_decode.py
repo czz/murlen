@@ -228,11 +228,37 @@ if __name__ == '__main__':
     core = MM.MultiUniverse(
         n, K=K, coppia=True, simbolo='sim' in sys.argv,
         mem_cap=cap)
-    train = dati(passi * 8, 1 + seed * 1000, NFATTI,
-                 blocchi)
-    hist, testa = allena(
-        core, finestre(train, vocab, dev), vocab, dev,
-        passi=passi, batch=8, seed=seed, lam_aperto=aperto)
+    if 'curr' in sys.argv:
+        # curriculum su prefisso: la fase con n_ep=k e'
+        # identica al compito a N=k (marche ordinate) —
+        # il canale si forma dove il task e' noto-formabile
+        # poi si estende a marche nuove con gradiente continuo
+        ramp = [NFATTI // 8, NFATTI // 4, NFATTI // 2,
+                NFATTI]
+        pf = passi // len(ramp)
+        hist, testa = [], None
+        for fi, n_ep in enumerate(ramp):
+            print('=== fase %d/%d: n_ep=%d, %d passi ==='
+                  % (fi + 1, len(ramp), n_ep, pf),
+                  flush=True)
+            tr = dati(pf * 8, 1 + seed * 1000 + fi,
+                      NFATTI, blocchi, n_ep=n_ep,
+                      pref=True)
+            h_f, testa = allena(
+                core, finestre(tr, vocab, dev), vocab,
+                dev, passi=pf, batch=8, seed=seed + fi,
+                testa=testa, lam_aperto=aperto)
+            hist += h_f
+            del tr
+            if dev == 'cuda':
+                torch.cuda.empty_cache()
+    else:
+        train = dati(passi * 8, 1 + seed * 1000, NFATTI,
+                     blocchi)
+        hist, testa = allena(
+            core, finestre(train, vocab, dev), vocab, dev,
+            passi=passi, batch=8, seed=seed,
+            lam_aperto=aperto)
     print('train: %.3f -> %.3f   lam=%.3f   cap=%d'
           '   aperto=%d' % (
               hist[0], sum(hist[-10:]) / 10,

@@ -35,24 +35,35 @@ MARK, QRY, ANS, GIUN = 300, 340, 400, 450
 L = 4 * WIN
 
 
-def dati(n, seed, nfatti, simboli=None):
+def dati(n, seed, nfatti, simboli=None, n_ep=None,
+         pref=False):
     """Testa [MARK+i, ANS+v_i] poi il resto della
     sequenza e' solo coppie [QRY+q, GIUN+v_q]
     mischiate — ogni fatto interrogato ~(L-2N)/(2N)
     volte. simboli = (mark, qry, ans, giun) per
-    nfatti oltre i range di default."""
+    nfatti oltre i range di default. n_ep<nfatti:
+    ogni episodio usa solo n_ep fatti — scelti a
+    caso fra gli nfatti, oppure il prefisso 0..n_ep-1
+    (pref=True: il task della fase e' identico al
+    compito a N=n_ep, marche in ordine)."""
     mk, qy, an, gj = simboli or (MARK, QRY, ANS, GIUN)
     r = random.Random(seed)
     out = []
     for _ in range(n):
-        vals = [r.randrange(NVAL) for _ in range(nfatti)]
+        if n_ep is None or n_ep >= nfatti:
+            ids_f = list(range(nfatti))
+        elif pref:
+            ids_f = list(range(n_ep))
+        else:
+            ids_f = r.sample(range(nfatti), n_ep)
+        vals = {i: r.randrange(NVAL) for i in ids_f}
         s = []
-        for i in range(nfatti):
+        for i in ids_f:
             s += [mk + i, an + vals[i]]
         npair = (L - len(s)) // 2
         for i in range(npair):
-            q = i % nfatti          # ordine ciclico:
-                                    # copertura uniforme
+            q = ids_f[i % len(ids_f)]  # ordine ciclico:
+                                       # copertura uniforme
             s += [qy + q, gj + vals[q]]
         out.append(s[:L])
     return out
